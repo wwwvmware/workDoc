@@ -86,3 +86,137 @@ Go 语言程序的 1.10 版本在启动时会初始化整片虚拟内存区域�
 ![avatar](./src/memCtr1.png)   
 
 如上图所示，运行时使用二维的 runtime.heapArena 数组管理所有的内存，每个单元都会管理 64MB 的内存空间：
+
+```go
+type heapArena struct {
+	bitmap       [heapArenaBitmapBytes]byte
+	spans        [pagesPerArena]*mspan
+	pageInUse    [pagesPerArena / 8]uint8
+	pageMarks    [pagesPerArena / 8]uint8
+	pageSpecials [pagesPerArena / 8]uint8
+	checkmarks   *checkmarksMap
+	zeroedBase   uintptr
+}
+```
+该结构体中的 bitmap 和 spans 与线性内存中的 bitmap 和 spans 区域一一对应，zeroedBase 字段指向了该结构体管理的内存的基地址。上述设计将原有的连续大内存切分成稀疏的小内存，而用于管理这些内存的元信息也被切成了小块。
+
+### 地址空间
+
+因为所有的内存最终都是要从操作系统中申请的，所以 Go 语言的运行时构建了操作系统的内存管理抽象层，该抽象层将运行时管理的地址空间分成以下四种状态8：
+
+|状态|解释|
+|-----|----|
+|None|内存没有被保留或者映射，是地址空间的默认状态|
+|Reserved|运行时持有该地址空间，但是访问该内存会导致错误|
+|Prepared|内存被保留，一般没有对应的物理内存访问该片内存的行为是未定义的可以快速转换到Ready状态|
+|Ready|可以被安全访问|   
+
+![avatar](./src/memoryStatusTrans.png)
+**地址空间状态转移图**
+
+* runtime.sysAlloc 会从操作系统中获取一大块可用的内存空间，可能为几百 KB 或者几 MB；
+* runtime.sysFree 会在程序发生内存不足（Out-of Memory，OOM）时调用并无条件地返回内存；
+* runtime.sysReserve 会保留操作系统中的一片内存区域，访问这片内存会触发异常；
+* runtime.sysMap 保证内存区域可以快速转换至就绪状态；
+* runtime.sysUsed 通知操作系统应用程序需要使用该内存区域，保证内存区域可以安全访问；
+* runtime.sysUnused 通知操作系统虚拟内存对应的物理内存已经不再需要，可以重用物理内存；
+* runtime.sysFault 将内存区域转换成保留状态，主要用于运行时的调试；
+
+运行时使用 Linux 提供的 mmap、munmap 和 madvise 等系统调用实现了操作系统的内存管理抽象层，抹平了不同操作系统的差异，为运行时提供了更加方便的接口
+
+### 内存管理组件
+
+Go 语言的内存分配器包含内存管理单元、线程缓存、中心缓存和页堆几个重要组件，对应的数据结构分别是**runtime.mspan**、**runtime.mcache**、**runtime.mcentral** 和 **runtime.mheap**.
+
+![avatar](./src/goMemLayout.png)
+
+所有的 Go 语言程序都会在启动时初始化如上图所示的内存布局，每一个处理器都会分配一个线程缓存 runtime.mcache 用于处理微对象和小对象的分配，它们会持有内存管理单元 runtime.mspan。
+
+每个类型的内存管理单元都会管理特定大小的对象，当内存管理单元中不存在空闲对象时，它们会从 runtime.mheap 持有的 134 个中心缓存 runtime.mcentral 中获取新的内存单元，中心缓存属于全局的堆结构体 runtime.mheap，它会从操作系统中申请内存。
+
+### 内存管理单元
+runtime.mspan 是 Go 语言内存管理的基本单元，该结构体中包含 next 和 prev 两个字段，它们分别指向了前一个和后一个 runtime.mspan：
+```go 
+type mspan struct {
+	next *mspan
+	prev *mspan
+	...
+}
+```
+串联后的上述结构体会构成如下双向链表，运行时会使用 runtime.mSpanList 存储双向链表的头结点和尾节点并在线程缓存以及中心缓存中使用。
+![avatar](./src/memUnitLinke.png)
+
+### 页和内存
+每个 runtime.mspan 都管理 npages 个大小为 8KB 的页，这里的页不是操作系统中的内存页，它们是操作系统内存页的整数倍，该结构体会使用下面这些字段来管理内存页的分配和回收：
+```go 
+type mspan struct {
+	startAddr uintptr // 起始地址
+	npages    uintptr // 页数
+	freeindex uintptr
+
+	allocBits  *gcBits
+	gcmarkBits *gcBits
+	allocCache uint64
+	...
+}
+```
+
+* startAddr 和 npages — 确定该结构体管理的多个页所在的内存，每个页的大小都是 8KB；
+* freeindex — 扫描页中空闲对象的初始索引；
+* allocBits 和 gcmarkBits — 分别用于标记内存的占用和回收情况；
+* allocCache — allocBits 的补码，可以用于快速查找内存中未被使用的内存
+当用户程序或者线程向**runtime.mspan**申请内存时，它会使用 allocCache 字段以对象为单位在管理的内存中快速查找待分配的空间：
+![avatar](./src/allocMemory.png)   
+**内存管理单元与对象**
+
+#### 内存管理单元状态
+该状态可能处于 mSpanDead、mSpanInUse、mSpanManual 和 mSpanFree 四种情况。当 runtime.mspan 在空闲堆中，它会处于 mSpanFree 状态；当 runtime.mspan 已经被分配时，它会处于 mSpanInUse、mSpanManual 状态，运行时会遵循下面的规则转换该状态：
+
+* 在垃圾回收的任意阶段，可能从 mSpanFree 转换到 mSpanInUse 和 mSpanManual；
+* 在垃圾回收的清除阶段，可能从 mSpanInUse 和 mSpanManual 转换到 mSpanFree；
+* 在垃圾回收的标记阶段，不能从 mSpanInUse 和 mSpanManual 转换到 mSpanFree；
+设置 runtime.mspan 状态的操作必须是原子性的以避免垃圾回收造成的线程竞争问题。
+
+### 跨度类
+runtime.spanClass 是 runtime.mspan 的跨度类，它决定了内存管理单元中存储的对象大小和个数：
+```go 
+type mspan struct {
+	...
+	spanclass   spanClass
+	...
+}
+```
+Go 语言的内存管理模块中一共包含 67 种跨度类，每一个跨度类都会存储特定大小的对象并且包含特定数量的页数以及对象，所有的数据都会被预选计算好并存储在 runtime.class_to_size 和 runtime.class_to_allocnpages 等变量中：
+
+|class|bytes/obj|bytes/span|object|tail waste|max waste|
+|-----|----------|-------------|------|-----------|------------|
+|1|8|8192|1024|0|87.50%|
+|2|16|8192|512|0|43.75%|
+|3|24|8192|341|0|29.24%|
+|4|32|8192|256|0|46.88%|
+|5|48|8192|170|32|31.52%|
+|...|...|...|...|...|...|
+|64|32768|32768|1|0|12.50%|
+
+上表展示了对象大小从 8B 到 32KB，总共 67 种跨度类的大小、存储的对象数以及浪费的内存空间，以表中的第五个跨度类为例，跨度类为 5 的 runtime.mspan 中对象的大小上限为 48 字节、管理 1 个页、最多可以存储 170 个对象。因为内存需要按照页进行管理，所以在尾部会浪费 32 字节的内存，当页中存储的对象都是 33 字节时，最多会浪费 31.52% 的资源：
+$$\frac{(48-33)*170+32}{8192} = 0.31518$$
+![avatar](./src/mspanWasteMemo.png)   
+**跨度类浪费的内存**
+
+除了上述 67 个跨度类之外，运行时中还包含 ID 为 0 的特殊跨度类，它能够管理大于 32KB 的特殊对象，我们会在后面详细介绍大对象的分配过程，在这里就不展开说明了。
+
+跨度类中除了存储类别的 ID 之外，它还会存储一个 noscan 标记位，该标记位表示对象是否包含指针，垃圾回收会对包含指针的 runtime.mspan 结构体进行扫描。我们可以通过下面的几个函数和方法了解 ID 和标记位的底层存储方式：
+
+```go
+func makeSpanClass(sizeclass uint8, noscan bool) spanClass {
+	return spanClass(sizeclass<<1) | spanClass(bool2int(noscan))
+}
+
+func (sc spanClass) sizeclass() int8 {
+	return int8(sc >> 1)
+}
+
+func (sc spanClass) noscan() bool {
+	return sc&1 != 0
+}
+```
