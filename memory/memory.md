@@ -220,3 +220,284 @@ func (sc spanClass) noscan() bool {
 	return sc&1 != 0
 }
 ```
+
+### 线程缓存
+
+runtime.mcache 是 Go 语言中的线程缓存，它会与线程上的处理器一一绑定，主要用来缓存用户程序申请的微小对象。每一个线程缓存都持有 68 * 2 个 runtime.mspan，这些内存管理单元都存储在结构体的 alloc 字段中：
+![avatar](./src/threadMemo.png)
+
+#### 初始化 
+运行时在初始化处理器时会调用 runtime.allocmcache 初始化线程缓存，该函数会在系统栈中使用 runtime.mheap 中的线程缓存分配器初始化新的 runtime.mcache 结构体：
+```go 
+func allocmcache() *mcache {
+	var c *mcache
+	systemstack(func() {
+		lock(&mheap_.lock)
+		c = (*mcache)(mheap_.cachealloc.alloc())
+		c.flushGen = mheap_.sweepgen
+		unlock(&mheap_.lock)
+	})
+	for i := range c.alloc {
+		c.alloc[i] = &emptymspan
+	}
+	c.nextSample = nextSample()
+	return c
+}
+```
+#### 替换 
+runtime.mcache.refill 会为线程缓存获取一个指定跨度类的内存管理单元，被替换的单元不能包含空闲的内存空间，而获取的单元中需要至少包含一个空闲对象用于分配内存,该方法会从中心缓存中申请新的 runtime.mspan 存储到线程缓存中，这也是向线程缓存插入内存管理单元的唯一方法。：
+```go
+func (c *mcache) refill(spc spanClass) {
+	s := c.alloc[spc]
+	s = mheap_.central[spc].mcentral.cacheSpan()
+	c.alloc[spc] = s
+}
+```
+#### 微分配器
+线程缓存中还包含几个用于分配微对象的字段，下面的这三个字段组成了微对象分配器，专门管理 16 字节以下的对象：
+```go 
+type mcache struct {
+	tiny             uintptr
+	tinyoffset       uintptr
+	local_tinyallocs uintptr
+}
+```
+微分配器只会用于分配非指针类型的内存，上述三个字段中 tiny 会指向堆中的一片内存，tinyOffset 是下一个空闲内存所在的偏移量，最后的 local_tinyallocs 会记录内存分配器中分配的对象个数。
+
+#### 中心缓存
+runtime.mcentral 是内存分配器的中心缓存，与线程缓存不同，访问中心缓存中的内存管理单元需要使用互斥锁：
+```go 
+type mcentral struct {
+	spanclass spanClass
+	partial  [2]spanSet
+	full     [2]spanSet
+}
+```
+##### 中心缓存的内存管理单元 
+线程缓存会通过中心缓存的 runtime.mcentral.cacheSpan 方法获取新的内存管理单元，该方法的实现比较复杂，我们可以将其分成以下几个部分：
+
+1. 调用 runtime.mcentral.partialSwept 从清理过的、包含空闲空间的 runtime.spanSet 结构中查找可以使用的内存管理单元；
+2. 调用 runtime.mcentral.partialUnswept 从未被清理过的、有空闲对象的 runtime.spanSet 结构中查找可以使用的内存管理单元；
+3. 调用 runtime.mcentral.fullUnswept 获取未被清理的、不包含空闲空间的 runtime.spanSet 中获取内存管理单元并通过 runtime.mspan.sweep 清理它的内存空间；
+4. 调用 runtime.mcentral.grow 从堆中申请新的内存管理单元；
+5. 更新内存管理单元的 allocCache 等字段帮助快速分配内存；   
+
+首先我们会在中心缓存的空闲集合中查找可用的 runtime.mspan，运行时总是会先从获取清理过的内存管理单元，后检查未清理的内存管理单元：
+```go
+func (c *mcentral) cacheSpan() *mspan {
+	sg := mheap_.sweepgen
+	spanBudget := 100
+
+	var s *mspan
+	if s = c.partialSwept(sg).pop(); s != nil {
+		goto havespan
+	}
+
+	for ; spanBudget >= 0; spanBudget-- {
+		s = c.partialUnswept(sg).pop()
+		if s == nil {
+			break
+		}
+		if atomic.Load(&s.sweepgen) == sg-2 && atomic.Cas(&s.sweepgen, sg-2, sg-1) {
+、			s.sweep(true)
+			goto havespan
+		}
+	}
+	...
+}
+```
+当找到需要回收的内存单元时，运行时会触发 runtime.mspan.sweep 进行清理，如果在包含空闲空间的集合中没有找到管理单元，那么运行时尝试会从未清理的集合中获取：
+```go 
+func (c *mcentral) cacheSpan() *mspan {
+	...
+	for ; spanBudget >= 0; spanBudget-- {
+		s = c.fullUnswept(sg).pop()
+		if s == nil {
+			break
+		}
+		if atomic.Load(&s.sweepgen) == sg-2 && atomic.Cas(&s.sweepgen, sg-2, sg-1) {
+、			s.sweep(true)
+、			freeIndex := s.nextFreeIndex()
+			if freeIndex != s.nelems {
+				s.freeindex = freeIndex
+				goto havespan
+			}
+、			c.fullSwept(sg).push(s)
+		}
+、	}
+	...
+}
+```
+如果 runtime.mcentral 通过上述两个阶段都没有找到可用的单元，它会调用 runtime.mcentral.grow 触发扩容从堆中申请新的内存：
+```go
+func (c *mcentral) cacheSpan() *mspan {
+	...
+	s = c.grow()
+	if s == nil {
+		return nil
+	}
+
+havespan:
+	freeByteBase := s.freeindex &^ (64 - 1)
+	whichByte := freeByteBase / 8
+	s.refillAllocCache(whichByte)
+
+	s.allocCache >>= s.freeindex % 64
+
+	return s
+}
+```
+### 扩容
+runtime.mheap.grow 会向操作系统申请更多的内存空间，传入的页数经过对齐可以得到期望的内存大小，我们可以将该方法的执行过程分成以下几个部分：
+1. 通过传入的页数获取期望分配的内存空间大小以及内存的基地址；
+2. 如果 arena 区域没有足够的空间，调用 runtime.mheap.sysAlloc 从操作系统中申请更多的内存；
+3. 扩容 runtime.mheap 持有的 arena 区域并更新页分配器的元信息；
+4. 在某些场景下，调用 runtime.pageAlloc.scavenge 回收不再使用的空闲内存页；
+
+在页堆扩容的过程中，runtime.mheap.sysAlloc 是页堆用来申请虚拟内存的方法，我们会分几部分介绍该方法的实现。首先，该方法会尝试在预保留的区域申请内存：
+```go
+func (h *mheap) sysAlloc(n uintptr) (v unsafe.Pointer, size uintptr) {
+	n = alignUp(n, heapArenaBytes)
+
+	v = h.arena.alloc(n, heapArenaBytes, &memstats.heap_sys)
+	if v != nil {
+		size = n
+		goto mapped
+	}
+	...
+}
+```
+上述代码会调用线性分配器的 runtime.linearAlloc.alloc 在预先保留的内存中申请一块可以使用的空间。如果没有可用的空间，我们会根据页堆的 arenaHints 在目标地址上尝试扩容：
+```go
+func (h *mheap) sysAlloc(n uintptr) (v unsafe.Pointer, size uintptr) {
+	...
+	for h.arenaHints != nil {
+		hint := h.arenaHints
+		p := hint.addr
+		v = sysReserve(unsafe.Pointer(p), n)
+		if p == uintptr(v) {
+			hint.addr = p
+			size = n
+			break
+		}
+		h.arenaHints = hint.next
+		h.arenaHintAlloc.free(unsafe.Pointer(hint))
+	}
+	...
+	sysMap(v, size, &memstats.heap_sys)
+	...
+}
+```
+runtime.sysReserve 和 runtime.sysMap 是上述代码的核心部分，它们会从操作系统中申请内存并将内存转换至 Prepared 状态。
+```go
+func (h *mheap) sysAlloc(n uintptr) (v unsafe.Pointer, size uintptr) {
+	...
+mapped:
+	for ri := arenaIndex(uintptr(v)); ri <= arenaIndex(uintptr(v)+size-1); ri++ {
+		l2 := h.arenas[ri.l1()]
+		r := (*heapArena)(h.heapArenaAlloc.alloc(unsafe.Sizeof(*r), sys.PtrSize, &memstats.gc_sys))
+		...
+		h.allArenas = h.allArenas[:len(h.allArenas)+1]
+		h.allArenas[len(h.allArenas)-1] = ri
+		atomic.StorepNoWB(unsafe.Pointer(&l2[ri.l2()]), unsafe.Pointer(r))
+	}
+	return
+}
+```
+runtime.mheap.sysAlloc 方法在最后会初始化一个新的 runtime.heapArena 来管理刚刚申请的内存空间，该结构会被加入页堆的二维矩阵中。
+
+### 内存分配
+堆上所有的对象都会通过调用 runtime.newobject 函数分配内存，该函数会调用 runtime.mallocgc 分配指定大小的内存空间，这也是用户程序向堆上申请内存空间的必经函数：
+```go
+func mallocgc(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
+	mp := acquirem()
+	mp.mallocing = 1
+
+	c := gomcache()
+	var x unsafe.Pointer
+	noscan := typ == nil || typ.ptrdata == 0
+	if size <= maxSmallSize {
+		if noscan && size < maxTinySize {
+			// 微对象分配
+		} else {
+			// 小对象分配
+		}
+	} else {
+		// 大对象分配
+	}
+
+	publicationBarrier()
+	mp.mallocing = 0
+	releasem(mp)
+
+	return x
+}
+```
+上述代码使用 runtime.gomcache 获取线程缓存并判断申请内存的类型是否为指针。我们从这个代码片段可以看出 runtime.mallocgc 会根据对象的大小执行不同的分配逻辑，在前面的章节也曾经介绍过运行时根据对象大小将它们分成微对象、小对象和大对象，这里会根据大小选择不同的分配逻辑：
+![avatar](./src/memoAlloc.png)
+* 微对象 (0, 16B) — 先使用微型分配器，再依次尝试线程缓存、中心缓存和堆分配内存；
+* 小对象 [16B, 32KB] — 依次尝试使用线程缓存、中心缓存和堆分配内存；
+* 大对象 (32KB, +∞) — 直接在堆上分配内存；
+
+#### 微对象
+Go 语言运行时将小于 16 字节的对象划分为微对象，它会使用线程缓存上的微分配器提高微对象分配的性能，我们主要使用它来分配较小的字符串以及逃逸的临时变量。微分配器可以将多个较小的内存分配请求合入同一个内存块中，只有当内存块中的所有对象都需要被回收时，整片内存才可能被回收。
+
+微分配器管理的对象不可以是指针类型，管理多个对象的内存块大小 maxTinySize 是可以调整的，在默认情况下，内存块的大小为 16 字节。maxTinySize 的值越大，组合多个对象的可能性就越高，内存浪费也就越严重；maxTinySize 越小，内存浪费就会越少，不过无论如何调整，8 的倍数都是一个很好的选择。
+![avatar](./src/minObj.png)
+如上图所示，微分配器已经在 16 字节的内存块中分配了 12 字节的对象，如果下一个待分配的对象小于 4 字节，它会直接使用上述内存块的剩余部分，减少内存碎片，不过该内存块只有所有对象都被标记为垃圾时才会回收。
+线程缓存 runtime.mcache 中的 tiny 字段指向了 maxTinySize 大小的块，如果当前块中还包含大小合适的空闲内存，运行时会通过基地址和偏移量获取并返回这块内存：
+```go
+func mallocgc(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
+	...
+	if size <= maxSmallSize {
+		if noscan && size < maxTinySize {
+			off := c.tinyoffset
+			if off+size <= maxTinySize && c.tiny != 0 {
+				x = unsafe.Pointer(c.tiny + off)
+				c.tinyoffset = off + size
+				c.local_tinyallocs++
+				releasem(mp)
+				return x
+			}
+			...
+		}
+		...
+	}
+	...
+}
+```
+当内存块中不包含空闲的内存时，下面的这段代码会先从线程缓存找到跨度类对应的内存管理单元 runtime.mspan，调用 runtime.nextFreeFast 获取空闲的内存；当不存在空闲内存时，我们会调用 runtime.mcache.nextFree 从中心缓存或者页堆中获取可分配的内存块：
+```go
+func mallocgc(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
+	...
+	if size <= maxSmallSize {
+		if noscan && size < maxTinySize {
+			...
+			span := c.alloc[tinySpanClass]
+			v := nextFreeFast(span)
+			if v == 0 {
+				v, _, _ = c.nextFree(tinySpanClass)
+			}
+			x = unsafe.Pointer(v)
+			(*[2]uint64)(x)[0] = 0
+			(*[2]uint64)(x)[1] = 0
+			if size < c.tinyoffset || c.tiny == 0 {
+				c.tiny = uintptr(x)
+				c.tinyoffset = size
+			}
+			size = maxTinySize
+		}
+		...
+	}
+	...
+	return x
+}
+```
+获取新的空闲内存块之后，上述代码会清空空闲内存中的数据、更新构成微对象分配器的几个字段 tiny 和 tinyoffset 并返回新的空闲内存。
+#### 小对象
+小对象是指大小为 16 字节到 32,768 字节的对象以及所有小于 16 字节的指针类型的对象，小对象的分配可以被分成以下的三个步骤：
+1. 确定分配对象的大小以及跨度类 runtime.spanClass；
+2. 从线程缓存、中心缓存或者堆中获取内存管理单元并从内存管理单元找到空闲的内存空间；
+3. 调用 runtime.memclrNoHeapPointers 清空空闲内存中的所有数据；
+
+确定待分配的对象大小以及跨度类需要使用预先计算好的 size_to_class8、size_to_class128 以及 class_to_size 字典，这些字典能够帮助我们快速获取对应的值并构建 runtime.spanClass：
