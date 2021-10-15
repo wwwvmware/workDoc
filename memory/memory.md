@@ -83,44 +83,20 @@ Go 语言程序的 1.10 版本在启动时会初始化整片虚拟内存区域�
 在Go1.11版本之后,Go对于堆内存的管理采用的是稀疏内存方案.主要是为了解决**使用线性内存导致的地址冲突,以及与C语言混编的内存分配问题**.但是由于采用了稀疏内存管理,失去了内存连续性的优势,这使得内存管理更加复杂.
 ![avatar](./src/memCtr1.png)   
 
-如上图所示，运行时使用二维的 runtime.heapArena 数组管理所有的内存，每个单元都会管理 64MB 的内存空间：
+如上图所示，运行时使用二维的 [runtime.heapArena](https://github.com/golang/go/blob/41d8e61a6b9d8f9db912626eb2bbc535e929fefc/src/runtime/mheap.go#L227) 数组管理所有的内存，每个单元都会管理 64MB 的内存空间：
 
 ```go
 type heapArena struct {
-	bitmap       [heapArenaBitmapBytes]byte
-	spans        [pagesPerArena]*mspan
-	pageInUse    [pagesPerArena / 8]uint8
-	pageMarks    [pagesPerArena / 8]uint8
-	pageSpecials [pagesPerArena / 8]uint8
-	checkmarks   *checkmarksMap
-	zeroedBase   uintptr
+	bitmap			[heapArenaBitmapBytes]byte
+	spans		 	[pagesPerArena]*mspan
+	pageInUse		[pagesPerArena / 8]uint8
+	pageMarks		[pagesPerArena / 8]uint8
+	pageSpecials		[pagesPerArena / 8]uint8
+	checkmarks		*checkmarksMap
+	zeroedBase		uintptr
 }
 ```
 该结构体中的 bitmap 和 spans 与线性内存中的 bitmap 和 spans 区域一一对应，zeroedBase 字段指向了该结构体管理的内存的基地址。上述设计将原有的连续大内存切分成稀疏的小内存，而用于管理这些内存的元信息也被切成了小块。
-
-#### 地址空间
-
-因为所有的内存最终都是要从操作系统中申请的，所以 Go 语言的运行时构建了操作系统的内存管理抽象层，该抽象层将运行时管理的地址空间分成以下四种状态8：
-
-|状态|解释|
-|-----|----|
-|None|内存没有被保留或者映射，是地址空间的默认状态|
-|Reserved|运行时持有该地址空间，但是访问该内存会导致错误|
-|Prepared|内存被保留，一般没有对应的物理内存访问该片内存的行为是未定义的可以快速转换到Ready状态|
-|Ready|可以被安全访问|   
-
-![avatar](./src/memoryStatusTrans.png)
-**地址空间状态转移图**
-
-* runtime.sysAlloc 会从操作系统中获取一大块可用的内存空间，可能为几百 KB 或者几 MB；
-* runtime.sysFree 会在程序发生内存不足（Out-of Memory，OOM）时调用并无条件地返回内存；
-* runtime.sysReserve 会保留操作系统中的一片内存区域，访问这片内存会触发异常；
-* runtime.sysMap 保证内存区域可以快速转换至就绪状态；
-* runtime.sysUsed 通知操作系统应用程序需要使用该内存区域，保证内存区域可以安全访问；
-* runtime.sysUnused 通知操作系统虚拟内存对应的物理内存已经不再需要，可以重用物理内存；
-* runtime.sysFault 将内存区域转换成保留状态，主要用于运行时的调试；
-
-运行时使用 Linux 提供的 mmap、munmap 和 madvise 等系统调用实现了操作系统的内存管理抽象层，抹平了不同操作系统的差异，为运行时提供了更加方便的接口
 
 #### 内存管理组件
 
@@ -163,9 +139,12 @@ type mspan struct {
 * freeindex — 扫描页中空闲对象的初始索引；
 * allocBits 和 gcmarkBits — 分别用于标记内存的占用和回收情况；
 * allocCache — allocBits 的补码，可以用于快速查找内存中未被使用的内存
+
 当用户程序或者线程向**runtime.mspan**申请内存时，它会使用 allocCache 字段以对象为单位在管理的内存中快速查找待分配的空间：
 ![avatar](./src/allocMemory.png)   
 **内存管理单元与对象**
+
+如果我们能在内存中找到空闲的内存单元会直接返回，当内存中不包含空闲的内存时，上一级的组件 runtime.mcache 会为调用 runtime.mcache.refill 更新内存管理单元以满足为更多对象分配内存的需求。
 
 ##### 内存管理单元状态
 该状态可能处于 mSpanDead、mSpanInUse、mSpanManual 和 mSpanFree 四种情况。当 runtime.mspan 在空闲堆中，它会处于 mSpanFree 状态；当 runtime.mspan 已经被分配时，它会处于 mSpanInUse、mSpanManual 状态，运行时会遵循下面的规则转换该状态：
@@ -221,7 +200,7 @@ func (sc spanClass) noscan() bool {
 
 #### 线程缓存
 
-runtime.mcache 是 Go 语言中的线程缓存，它会与线程上的处理器一一绑定，主要用来缓存用户程序申请的微小对象。每一个线程缓存都持有 68 * 2 个 runtime.mspan，这些内存管理单元都存储在结构体的 alloc 字段中：
+runtime.mcache 是 Go 语言中的线程缓存，它会与线程上的处理器一一绑定，主要用来缓存用户程序申请的微小对象。每一个线程缓存都持有 68 * 2 个 runtime.mspan,这表明sizeClass[0-67]这些跨度类会均匀分布在alloc中：
 ![avatar](./src/threadMemo.png)
 
 ##### 初始化 
@@ -262,7 +241,7 @@ type mcache struct {
 ```
 微分配器只会用于分配非指针类型的内存，上述三个字段中 tiny 会指向堆中的一片内存，tinyOffset 是下一个空闲内存所在的偏移量，最后的 local_tinyallocs 会记录内存分配器中分配的对象个数。
 
-##### 中心缓存
+#### 中心缓存
 runtime.mcentral 是内存分配器的中心缓存，与线程缓存不同，访问中心缓存中的内存管理单元需要使用互斥锁：
 ```go 
 type mcentral struct {
@@ -271,6 +250,7 @@ type mcentral struct {
 	full     [2]spanSet
 }
 ```
+每个中心缓存都会管理某个跨度类的内存管理单元，它会同时持有两个 runtime.spanSet，分别存储包含空闲对象和不包含空闲对象的内存管理单元。
 ##### 中心缓存的内存管理单元 
 线程缓存会通过中心缓存的 runtime.mcentral.cacheSpan 方法获取新的内存管理单元，该方法的实现比较复杂，我们可以将其分成以下几个部分：
 
@@ -346,6 +326,143 @@ havespan:
 }
 ```
 ##### 扩容
+中心缓存的扩容方法 runtime.mcentral.grow 会根据预先计算的 class_to_allocnpages 和 class_to_size 获取待分配的页数以及跨度类并调用 runtime.mheap.alloc 获取新的 runtime.mspan 结构：
+```go
+func (c *mcentral) grow() *mspan {
+	npages := uintptr(class_to_allocnpages[c.spanclass.sizeclass()])
+	size := uintptr(class_to_size[c.spanclass.sizeclass()])
+
+	s := mheap_.alloc(npages, c.spanclass, true)
+	if s == nil {
+		return nil
+	}
+
+	n := (npages << _PageShift) >> s.divShift * uintptr(s.divMul) >> s.divShift2
+	s.limit = s.base() + size*n
+	heapBitsForAddr(s.base()).initSpan(s)
+	return s
+}
+```
+获取了 runtime.mspan 后，我们会在上述方法中初始化 limit 字段并清除该结构在堆上对应的位图。
+
+#### 页堆
+
+runtime.mheap 是内存分配的核心结构体，Go 语言程序会将其作为全局变量存储，而堆上初始化的所有对象都由该结构体统一管理，该结构体中包含两组非常重要的字段，其中一个是全局的中心缓存列表 central，另一个是管理堆区内存区域的 arenas 以及相关字段。
+
+页堆中包含一个长度为 136 的 runtime.mcentral 数组，其中 68 个为跨度类需要 scan 的中心缓存，另外的 68 个是 noscan 的中心缓存：
+
+![avatar](./src/pageHeap.png)
+
+##### 初始化
+堆区的初始化会使用 runtime.mheap.init 方法，我们能看到该方法初始化了非常多的结构体和字段，不过其中初始化的两类变量比较重要：
+1. spanalloc、cachealloc 以及 arenaHintAlloc 等 runtime.fixalloc 类型的空闲链表分配器；
+2. central 切片中 runtime.mcentral 类型的中心缓存；
+```go
+func (h *mheap) init() {
+	h.spanalloc.init(unsafe.Sizeof(mspan{}), recordspan, unsafe.Pointer(h), &memstats.mspan_sys)
+	h.cachealloc.init(unsafe.Sizeof(mcache{}), nil, nil, &memstats.mcache_sys)
+	h.specialfinalizeralloc.init(unsafe.Sizeof(specialfinalizer{}), nil, nil, &memstats.other_sys)
+	h.specialprofilealloc.init(unsafe.Sizeof(specialprofile{}), nil, nil, &memstats.other_sys)
+	h.arenaHintAlloc.init(unsafe.Sizeof(arenaHint{}), nil, nil, &memstats.other_sys)
+
+	h.spanalloc.zero = false
+
+	for i := range h.central {
+		h.central[i].mcentral.init(spanClass(i))
+	}
+
+	h.pages.init(&h.lock, &memstats.gc_sys)
+}
+```
+堆中初始化的多个空闲链表分配器与设计原理中提到的分配器没有太多区别，当我们调用 runtime.fixalloc.init 初始化分配器时，需要传入待初始化的结构体大小等信息，这会帮助分配器分割待分配的内存，它提供了以下两个用于分配和释放内存的方法：
+
+1. runtime.fixalloc.alloc — 获取下一个空闲的内存空间；
+2. runtime.fixalloc.free — 释放指针指向的内存空间；
+
+除了这些空闲链表分配器之外，我们还会在该方法中初始化所有的中心缓存，这些中心缓存会维护全局的内存管理单元，各个线程会通过中心缓存获取新的内存单元。
+
+##### 内存管理单元
+
+runtime.mheap 是内存分配器中的核心组件，运行时会通过它的 runtime.mheap.alloc 方法在系统栈中获取新的 runtime.mspan 单元：
+
+```go
+func (h *mheap) alloc(npages uintptr, spanclass spanClass, needzero bool) *mspan {
+	var s *mspan
+	systemstack(func() {
+		if h.sweepdone == 0 {
+			h.reclaim(npages)
+		}
+		s = h.allocSpan(npages, false, spanclass, &memstats.heap_inuse)
+	})
+	...
+	return s
+}
+```
+为了阻止内存的大量占用和堆的增长，我们在分配对应页数的内存前需要先调用 runtime.mheap.reclaim 方法回收一部分内存，随后运行时通过 runtime.mheap.allocSpan 分配新的内存管理单元，我们会将该方法的执行过程拆分成两个部分：
+
+1. 从堆上分配新的内存页和内存管理单元 runtime.mspan；
+2. 初始化内存管理单元并将其加入 runtime.mheap 持有内存单元列表；
+
+首先我们需要在堆上申请 npages 数量的内存页并初始化 runtime.mspan：
+```go
+func (h *mheap) allocSpan(npages uintptr, typ spanAllocType, spanclass spanClass) (s *mspan) {
+	gp := getg()
+	base, scav := uintptr(0), uintptr(0)
+	pp := gp.m.p.ptr()
+	if pp != nil && npages < pageCachePages/4 {
+		c := &pp.pcache
+		base, scav = c.alloc(npages)
+		if base != 0 {
+			s = h.tryAllocMSpan()
+			if s != nil && gcBlackenEnabled == 0 && (manual || spanclass.sizeclass() != 0) {
+				goto HaveSpan
+			}
+		}
+	}
+
+	if base == 0 {
+		base, scav = h.pages.alloc(npages)
+		if base == 0 {
+			h.grow(npages)
+            base, scav = h.pages.alloc(npages)
+			if base == 0 {
+				throw("grew heap, but no adequate free space found")
+			}
+		}
+	}
+	if s == nil {
+		s = h.allocMSpanLocked()
+	}
+	...
+}
+```
+上述方法会通过处理器的页缓存 runtime.pageCache 或者全局的页分配器 runtime.pageAlloc 两种途径从堆中申请内存：
+
+1. 如果申请的内存比较小，获取申请内存的处理器并尝试调用 runtime.pageCache.alloc 获取内存区域的基地址和大小；
+2. 如果申请的内存比较大或者线程的页缓存中内存不足，会通过 runtime.pageAlloc.alloc 在页堆上申请内存；
+3. 如果发现页堆上的内存不足，会尝试通过 runtime.mheap.grow 扩容并重新调用 runtime.pageAlloc.alloc 申请内存；
+	1. 如果申请到内存，意味着扩容成功；
+	2. 如果没有申请到内存，意味着扩容失败，宿主机可能不存在空闲内存，运行时会直接中止当前程序；
+
+无论通过哪种方式获得内存页，我们都会在该函数中分配新的 runtime.mspan 结构体；该方法的剩余部分会通过页数、内存空间以及跨度类等参数初始化它的多个字段：
+```go
+func (h *mheap) alloc(npages uintptr, spanclass spanClass, needzero bool) *mspan {
+	...
+HaveSpan:
+	s.init(base, npages)
+
+	...
+
+	s.freeindex = 0
+	s.allocCache = ^uint64(0)
+	s.gcmarkBits = newMarkBits(s.nelems)
+	s.allocBits = newAllocBits(s.nelems)
+	h.setSpans(s.base(), npages, s)
+	return s
+}
+```
+
+#### 扩容
 runtime.mheap.grow 会向操作系统申请更多的内存空间，传入的页数经过对齐可以得到期望的内存大小，我们可以将该方法的执行过程分成以下几个部分：
 1. 通过传入的页数获取期望分配的内存空间大小以及内存的基地址；
 2. 如果 arena 区域没有足够的空间，调用 runtime.mheap.sysAlloc 从操作系统中申请更多的内存；
@@ -386,7 +503,23 @@ func (h *mheap) sysAlloc(n uintptr) (v unsafe.Pointer, size uintptr) {
 	...
 }
 ```
-runtime.sysReserve 和 runtime.sysMap 是上述代码的核心部分，它们会从操作系统中申请内存并将内存转换至 Prepared 状态。
+runtime.sysReserve 和 runtime.sysMap 是上述代码的核心部分，它们会从操作系统中申请内存并将内存转换至就绪状态。
+
+```go
+func (h *mheap) sysAlloc(n uintptr) (v unsafe.Pointer, size uintptr) {
+	...
+mapped:
+	for ri := arenaIndex(uintptr(v)); ri <= arenaIndex(uintptr(v)+size-1); ri++ {
+		l2 := h.arenas[ri.l1()]
+		r := (*heapArena)(h.heapArenaAlloc.alloc(unsafe.Sizeof(*r), sys.PtrSize, &memstats.gc_sys))
+		...
+		h.allArenas = h.allArenas[:len(h.allArenas)+1]
+		h.allArenas[len(h.allArenas)-1] = ri
+		atomic.StorepNoWB(unsafe.Pointer(&l2[ri.l2()]), unsafe.Pointer(r))
+	}
+	return
+}
+```
 ```go
 func (h *mheap) sysAlloc(n uintptr) (v unsafe.Pointer, size uintptr) {
 	...
@@ -403,6 +536,7 @@ mapped:
 }
 ```
 runtime.mheap.sysAlloc 方法在最后会初始化一个新的 runtime.heapArena 来管理刚刚申请的内存空间，该结构会被加入页堆的二维矩阵中。
+
 
 ##### 内存分配
 堆上所有的对象都会通过调用 runtime.newobject 函数分配内存，该函数会调用 runtime.mallocgc 分配指定大小的内存空间，这也是用户程序向堆上申请内存空间的必经函数：
