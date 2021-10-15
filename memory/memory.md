@@ -462,82 +462,6 @@ HaveSpan:
 }
 ```
 
-#### 扩容
-runtime.mheap.grow 会向操作系统申请更多的内存空间，传入的页数经过对齐可以得到期望的内存大小，我们可以将该方法的执行过程分成以下几个部分：
-1. 通过传入的页数获取期望分配的内存空间大小以及内存的基地址；
-2. 如果 arena 区域没有足够的空间，调用 runtime.mheap.sysAlloc 从操作系统中申请更多的内存；
-3. 扩容 runtime.mheap 持有的 arena 区域并更新页分配器的元信息；
-4. 在某些场景下，调用 runtime.pageAlloc.scavenge 回收不再使用的空闲内存页；
-
-在页堆扩容的过程中，runtime.mheap.sysAlloc 是页堆用来申请虚拟内存的方法，我们会分几部分介绍该方法的实现。首先，该方法会尝试在预保留的区域申请内存：
-```go
-func (h *mheap) sysAlloc(n uintptr) (v unsafe.Pointer, size uintptr) {
-	n = alignUp(n, heapArenaBytes)
-
-	v = h.arena.alloc(n, heapArenaBytes, &memstats.heap_sys)
-	if v != nil {
-		size = n
-		goto mapped
-	}
-	...
-}
-```
-上述代码会调用线性分配器的 runtime.linearAlloc.alloc 在预先保留的内存中申请一块可以使用的空间。如果没有可用的空间，我们会根据页堆的 arenaHints 在目标地址上尝试扩容：
-```go
-func (h *mheap) sysAlloc(n uintptr) (v unsafe.Pointer, size uintptr) {
-	...
-	for h.arenaHints != nil {
-		hint := h.arenaHints
-		p := hint.addr
-		v = sysReserve(unsafe.Pointer(p), n)
-		if p == uintptr(v) {
-			hint.addr = p
-			size = n
-			break
-		}
-		h.arenaHints = hint.next
-		h.arenaHintAlloc.free(unsafe.Pointer(hint))
-	}
-	...
-	sysMap(v, size, &memstats.heap_sys)
-	...
-}
-```
-runtime.sysReserve 和 runtime.sysMap 是上述代码的核心部分，它们会从操作系统中申请内存并将内存转换至就绪状态。
-
-```go
-func (h *mheap) sysAlloc(n uintptr) (v unsafe.Pointer, size uintptr) {
-	...
-mapped:
-	for ri := arenaIndex(uintptr(v)); ri <= arenaIndex(uintptr(v)+size-1); ri++ {
-		l2 := h.arenas[ri.l1()]
-		r := (*heapArena)(h.heapArenaAlloc.alloc(unsafe.Sizeof(*r), sys.PtrSize, &memstats.gc_sys))
-		...
-		h.allArenas = h.allArenas[:len(h.allArenas)+1]
-		h.allArenas[len(h.allArenas)-1] = ri
-		atomic.StorepNoWB(unsafe.Pointer(&l2[ri.l2()]), unsafe.Pointer(r))
-	}
-	return
-}
-```
-```go
-func (h *mheap) sysAlloc(n uintptr) (v unsafe.Pointer, size uintptr) {
-	...
-mapped:
-	for ri := arenaIndex(uintptr(v)); ri <= arenaIndex(uintptr(v)+size-1); ri++ {
-		l2 := h.arenas[ri.l1()]
-		r := (*heapArena)(h.heapArenaAlloc.alloc(unsafe.Sizeof(*r), sys.PtrSize, &memstats.gc_sys))
-		...
-		h.allArenas = h.allArenas[:len(h.allArenas)+1]
-		h.allArenas[len(h.allArenas)-1] = ri
-		atomic.StorepNoWB(unsafe.Pointer(&l2[ri.l2()]), unsafe.Pointer(r))
-	}
-	return
-}
-```
-runtime.mheap.sysAlloc 方法在最后会初始化一个新的 runtime.heapArena 来管理刚刚申请的内存空间，该结构会被加入页堆的二维矩阵中。
-
-
 ##### 内存分配
 堆上所有的对象都会通过调用 runtime.newobject 函数分配内存，该函数会调用 runtime.mallocgc 分配指定大小的内存空间，这也是用户程序向堆上申请内存空间的必经函数：
 ```go
@@ -742,5 +666,9 @@ func (c *mcache) allocLarge(size uintptr, needzero bool, noscan bool) *mspan {
 ```
 申请内存时会创建一个跨度类为 0 的 runtime.spanClass 并调用 runtime.mheap.alloc 分配一个管理对应内存的管理单元。
 
+### 总结
+Go在内存分配上采用了分治的思想，将内存分割成固定的大小，将申请的内存根据大小选择合适的内存块，提高了分配效率，且减少了内存的碎片。
+
 ## 参考资料
 * [面向信仰编程-go语言设计与实现-go内存管理](https://draveness.me/golang/docs/part3-runtime/ch07-memory/golang-memory-allocator/)
+* [可视化Go内存管理](./src/https://tonybai.com/2020/03/10/visualizing-memory-management-in-golang/)
